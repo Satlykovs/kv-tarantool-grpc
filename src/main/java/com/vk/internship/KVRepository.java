@@ -3,34 +3,45 @@ package com.vk.internship;
 import io.tarantool.client.box.TarantoolBoxClient;
 import io.tarantool.client.box.TarantoolBoxSpace;
 import io.tarantool.client.box.options.SelectOptions;
+import io.tarantool.client.factory.TarantoolBoxClientBuilder;
 import io.tarantool.client.factory.TarantoolFactory;
 import io.tarantool.core.protocol.BoxIterator;
-import io.tarantool.mapping.SelectResponse;
 import io.tarantool.mapping.Tuple;
+import io.tarantool.pool.InstanceConnectionGroup;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.concurrent.ExecutionException;
-import java.util.logging.Logger;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 
 
 public class KVRepository
 {
-    private static final Logger logger = Logger.getLogger(KVRepository.class.getName());
+    private static final Logger logger = LoggerFactory.getLogger(KVRepository.class);
     private final TarantoolBoxClient client;
+    private final String spaceName;
 
-    public KVRepository(String host, int port, String username, String password)
+    public KVRepository(String host, int port, String username, String password, String spaceName)
     {
         try
         {
-            var builder = TarantoolFactory.box()
-                    .withHost(host)
-                    .withPort(port)
-                    .withUser(username);
-            if (password != null && !password.isEmpty())
-            {
-                builder = builder.withPassword(password);
-            }
+            this.spaceName = spaceName;
+
+
+            InstanceConnectionGroup group = InstanceConnectionGroup.builder().withHost(host)
+                    .withPort(port).withUser(username)
+                    .withPassword(password != null && !password.isEmpty() ? password : null)
+                    .withSize(8).build();
+
+            List<InstanceConnectionGroup> groups = Collections.singletonList(group);
+
+            TarantoolBoxClientBuilder builder = TarantoolFactory.box().withGroups(groups);
+
+
             this.client = builder.build();
+
+            logger.info("Successfully connected to Tarantool at {}:{}", host, port);
         } catch (Exception e)
         {
             throw new RuntimeException("Failed to connect to Tarantool", e);
@@ -39,49 +50,63 @@ public class KVRepository
 
     private TarantoolBoxSpace space()
     {
-        return client.space("KV");
+        return client.space(spaceName);
     }
 
-    public void put(String key, byte[] value) throws ExecutionException, InterruptedException
+    public CompletableFuture<Void> putAsync(String key, byte[] value)
     {
 
-        space().replace(Arrays.asList(key, value)).get();
+        return space().replace(Arrays.asList(key, value))
+                .thenApply(ignored -> null);
     }
 
-    public byte[] get(String key) throws ExecutionException, InterruptedException
+    public CompletableFuture<byte[]> getAsync(String key)
     {
-        SelectResponse<List<Tuple<List<?>>>> response = space().select(
-                Collections.singletonList(key)).get();
+        SelectOptions opts = SelectOptions.builder()
+                .withIterator(BoxIterator.EQ)
+                .withLimit(1)
+                .build();
 
-        List<Tuple<List<?>>> tuples = response.get();
+        return space().select(Collections.singletonList(key), opts)
+                .thenApply(response ->
+                {
+                    List<Tuple<List<?>>> tuples = response.get();
 
-        if (tuples == null || tuples.isEmpty()) return null;
+                    if (tuples == null || tuples.isEmpty()) return null;
 
-        List<?> fields = tuples.getFirst().get();
-        if (fields.size() <= 1) return null;
+                    List<?> fields = tuples.getFirst().get();
+                    if (fields.size() <= 1) return null;
+                    return (fields.get(1) instanceof byte[] byteArray) ? byteArray :
+                            null;
+                });
 
-
-        if (fields.get(1) instanceof byte[] byteArray)
-        {
-            return byteArray;
-        }
-        return null;
     }
 
-    public void delete(String key) throws ExecutionException, InterruptedException
+    public CompletableFuture<Void> deleteAsync(String key)
     {
-        space().delete(Collections.singletonList(key)).get();
+        return space().delete(Collections.singletonList(key))
+                .thenApply(ignored -> null);
     }
 
-    public Iterator<Map.Entry<String, byte[]>> range(String keySince, String keyTo, int batchSize)
+    public CompletableFuture<Void> rangeAsync(String keySince, String keyTo,
+                                              int batchSize,
+                                              Consumer<Map.Entry<String, byte[]>> consumer)
     {
-        return new RangeIterator(keySince, keyTo, batchSize);
+        return rangeBatchAsync(keySince, keyTo, batchSize, null, true, consumer);
     }
 
-    public long count() throws ExecutionException, InterruptedException
+    public CompletableFuture<Long> countAsync()
     {
-        List<?> result = client.eval("return box.space.KV:len()").get().get();
-        return (long) result.getFirst();
+        String script = String.format("return box.space['%s']:len()", spaceName);
+
+        return client.eval(script)
+                .thenApply(result ->
+                {
+                    List<?> list = result.get();
+                    Object val = list.getFirst();
+                    return ((Number) val).longValue();
+                });
+
     }
 
     public void close()
@@ -93,112 +118,65 @@ public class KVRepository
                 client.close();
             } catch (Exception e)
             {
-                logger.severe("Error closing Tarantool client: " + e.getMessage());
+                logger.error("Error closing Tarantool client: {}", e.getMessage());
             }
         }
     }
 
-    private class RangeIterator implements Iterator<Map.Entry<String, byte[]>>
+
+    private CompletableFuture<Void> rangeBatchAsync(String keySince, String keyTo,
+                                                    int batchSize, String lastKey,
+                                                    boolean isFirst,
+                                                    Consumer<Map.Entry<String, byte[]>> consumer)
     {
 
-        private final String keyTo;
-        private final int batchSize;
-        private final String keySince;
+        BoxIterator iterator = isFirst ? BoxIterator.GE : BoxIterator.GT;
+        String searchKey = isFirst ? keySince : lastKey;
 
-        private String lastKey = null;
-        private List<Tuple<List<?>>> currentBatch;
-        private int currentIndex = 0;
-        private boolean finished = false;
-        private boolean isFirstLoad = true;
+        SelectOptions opts = SelectOptions.builder()
+                .withLimit(batchSize)
+                .withIterator(iterator)
+                .build();
 
-        RangeIterator(String keySince, String keyTo, int batchSize)
-        {
-            this.keySince = keySince;
-            this.keyTo = keyTo;
-            this.batchSize = batchSize;
-
-            loadBatch();
-        }
-
-        private void loadBatch()
-        {
-            try
-            {
-                BoxIterator iterator = isFirstLoad ? BoxIterator.GE : BoxIterator.GT;
-                String searchKey = isFirstLoad ? keySince : lastKey;
-
-                SelectOptions options = SelectOptions.builder()
-                        .withLimit(batchSize)
-                        .withIterator(iterator)
-                        .build();
-
-                SelectResponse<List<Tuple<List<?>>>> response = space().select(
-                        Collections.singletonList(searchKey), options).get();
-
-                currentBatch = response.get();
-
-                if (currentBatch == null || currentBatch.isEmpty())
+        return space().select(Collections.singletonList(searchKey), opts)
+                .thenCompose(response ->
                 {
-                    finished = true;
-                } else
-                {
-                    Tuple<List<?>> lastTuple = currentBatch.getLast();
-                    lastKey = (String) lastTuple.get().getFirst();
-                    currentIndex = 0;
-                    isFirstLoad = false;
-                }
-            } catch (Exception e)
-            {
-                finished = true;
-                currentBatch = null;
-            }
-        }
+                    List<Tuple<List<?>>> tuples = response.get();
 
-        @Override
-        public boolean hasNext()
-        {
-            if (finished) return false;
-            if (currentBatch != null && currentIndex < currentBatch.size())
-            {
-                String nextKey = (String) currentBatch.get(currentIndex).get().getFirst();
-                if (nextKey.compareTo(keyTo) > 0)
-                {
-                    finished = true;
-                    return false;
-                }
-                return true;
-            }
-            if (currentBatch != null && currentBatch.size() == batchSize)
-            {
-                loadBatch();
-                return hasNext();
-            }
-            return false;
-        }
+                    if (tuples == null || tuples.isEmpty())
+                    {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    for (Tuple<List<?>> tuple : tuples)
+                    {
+                        List<?> fields = tuple.get();
 
-        @Override
-        public Map.Entry<String, byte[]> next()
-        {
-            if (!hasNext()) throw new NoSuchElementException();
+                        String key = (String) fields.getFirst();
 
-            Tuple<List<?>> tuple = currentBatch.get(currentIndex++);
+                        if (key.compareTo(keyTo) > 0)
+                        {
+                            return CompletableFuture.completedFuture(null);
+                        }
 
-            List<?> fields = tuple.get();
-            String key = (String) fields.getFirst();
+                        byte[] value =
+                                (fields.size() > 1 && fields.get(
+                                        1) instanceof byte[] byteArray) ? byteArray : null;
 
-            if (key.compareTo(keyTo) > 0)
-            {
-                finished = true;
-                throw new NoSuchElementException();
-            }
+                        consumer.accept(new AbstractMap.SimpleEntry<>(key, value));
+                    }
 
-            byte[] value = null;
-            if (fields.size() > 1 && fields.get(1) instanceof byte[] byteArray)
-            {
-                value = byteArray;
-            }
-            return new AbstractMap.SimpleEntry<>(key, value);
+                    if (tuples.size() == batchSize)
+                    {
+                        String newLastKey = (String) tuples.getLast().get().getFirst();
+                        return rangeBatchAsync(keySince, keyTo, batchSize, newLastKey, false,
+                                consumer);
+                    } else
+                    {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                });
 
-        }
+
     }
+
 }

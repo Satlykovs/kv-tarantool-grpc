@@ -3,18 +3,19 @@ package com.vk.internship;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.Iterator;
-import java.util.Map;
 
-
-public class KVServiceImpl extends com.vk.internship.KVServiceGrpc.KVServiceImplBase
+public class KVServiceImpl extends KVServiceGrpc.KVServiceImplBase
 {
+    private static final String BAD_KEY_MESSAGE = "Key cannot be null or empty";
     private final KVRepository repository;
+    private final Logger logger = LoggerFactory.getLogger(KVServiceImpl.class);
 
-    public KVServiceImpl(String host, int port, String username, String password)
+    public KVServiceImpl(KVRepository repository)
     {
-        this.repository = new KVRepository(host, port, username, password);
+        this.repository = repository;
     }
 
     private boolean isInvalidKey(String key)
@@ -23,71 +24,66 @@ public class KVServiceImpl extends com.vk.internship.KVServiceGrpc.KVServiceImpl
     }
 
     @Override
-    public void put(com.vk.internship.PutRequest request,
-                    StreamObserver<com.vk.internship.PutResponse> responseObserver)
+    public void put(PutRequest request,
+                    StreamObserver<PutResponse> responseObserver)
     {
-        try
+        String key = request.getKey();
+        if (isInvalidKey(key))
         {
-            String key = request.getKey();
-            if (isInvalidKey(key))
-            {
-                responseObserver.onError(
-                        Status.INVALID_ARGUMENT.withDescription("Key cannot be null or empty")
-                                .asRuntimeException());
-                return;
-            }
-            byte[] value = request.hasValue() ? request.getValue().toByteArray() : null;
-
-            repository.put(key, value);
-
-            responseObserver.onNext(
-                    com.vk.internship.PutResponse.newBuilder().setSuccess(true).build());
-        } catch (Exception e)
-        {
-            responseObserver.onNext(
-                    com.vk.internship.PutResponse.newBuilder().setSuccess(false).build());
-        } finally
-        {
-            responseObserver.onCompleted();
-            ;
+            responseObserver.onError(
+                    Status.INVALID_ARGUMENT.withDescription(BAD_KEY_MESSAGE)
+                            .asRuntimeException());
+            return;
         }
 
+
+        byte[] value = request.hasValue() ? request.getValue().toByteArray() : null;
+
+        repository.putAsync(key, value).whenComplete((result, ex) ->
+        {
+            if (ex != null)
+            {
+                logger.error("Failed to PUT key '{} : {}", key, ex.getMessage(), ex);
+                responseObserver.onError(Status.INTERNAL.withCause(ex).asRuntimeException());
+            } else
+            {
+                responseObserver.onNext(PutResponse.newBuilder().setSuccess(true).build());
+                responseObserver.onCompleted();
+            }
+        });
+
     }
+
 
     @Override
     public void get(com.vk.internship.GetRequest request,
                     StreamObserver<com.vk.internship.GetResponse> responseObserver)
     {
-        try
+
+        String key = request.getKey();
+        if (isInvalidKey(key))
         {
-            String key = request.getKey();
-            if (isInvalidKey(key))
-            {
-                responseObserver.onError(
-                        Status.INVALID_ARGUMENT.withDescription("Key cannot be null or empty")
-                                .asRuntimeException());
-                return;
-            }
-
-            byte[] value = repository.get(key);
-
-            com.vk.internship.GetResponse.Builder builder =
-                    com.vk.internship.GetResponse.newBuilder();
-
-            if (value != null)
-            {
-                builder.setValue(ByteString.copyFrom(value));
-            }
-
-            responseObserver.onNext(builder.build());
-
-        } catch (Exception e)
-        {
-            responseObserver.onNext(com.vk.internship.GetResponse.getDefaultInstance());
-        } finally
-        {
-            responseObserver.onCompleted();
+            responseObserver.onError(
+                    Status.INVALID_ARGUMENT.withDescription(BAD_KEY_MESSAGE)
+                            .asRuntimeException());
+            return;
         }
+
+
+        repository.getAsync(key).whenComplete((value, ex) ->
+        {
+            if (ex != null)
+            {
+                logger.error("Failed to GET key: '{}' : {}", key, ex.getMessage(), ex);
+                responseObserver.onError(Status.INTERNAL.withCause(ex).asRuntimeException());
+            } else
+            {
+                GetResponse.Builder builder = GetResponse.newBuilder();
+                if (value != null) builder.setValue(ByteString.copyFrom(value));
+                responseObserver.onNext(builder.build());
+                responseObserver.onCompleted();
+            }
+        });
 
     }
 
@@ -96,36 +92,37 @@ public class KVServiceImpl extends com.vk.internship.KVServiceGrpc.KVServiceImpl
     public void delete(com.vk.internship.DeleteRequest request,
                        StreamObserver<com.vk.internship.DeleteResponse> responseObserver)
     {
-        try
-        {
-            String key = request.getKey();
 
-            if (isInvalidKey(key))
-            {
-                responseObserver.onError(
-                        Status.INVALID_ARGUMENT.withDescription("Key cannot be null or empty")
-                                .asRuntimeException());
-                return;
-            }
+        String key = request.getKey();
 
-            repository.delete(key);
-            responseObserver.onNext(
-                    com.vk.internship.DeleteResponse.newBuilder().setSuccess(true).build());
-
-        } catch (Exception e)
+        if (isInvalidKey(key))
         {
-            responseObserver.onNext(
-                    com.vk.internship.DeleteResponse.newBuilder().setSuccess(false).build());
-        } finally
-        {
-            responseObserver.onCompleted();
+            responseObserver.onError(
+                    Status.INVALID_ARGUMENT.withDescription(BAD_KEY_MESSAGE)
+                            .asRuntimeException());
+            return;
         }
+
+
+        repository.deleteAsync(key).whenComplete((result, ex) ->
+        {
+            if (ex != null)
+            {
+                logger.error("Failed to DELETE key '{}' : {}", key, ex.getMessage(), ex);
+                responseObserver.onError(Status.INTERNAL.withCause(ex).asRuntimeException());
+            } else
+            {
+                responseObserver.onNext(DeleteResponse.newBuilder().setSuccess(true).build());
+                responseObserver.onCompleted();
+            }
+        });
+
     }
 
 
     @Override
-    public void range(com.vk.internship.RangeRequest request,
-                      StreamObserver<com.vk.internship.Entry> responseObserver)
+    public void range(RangeRequest request,
+                      StreamObserver<Entry> responseObserver)
     {
         String keySince = request.getKeySince();
         String keyTo = request.getKeyTo();
@@ -145,48 +142,52 @@ public class KVServiceImpl extends com.vk.internship.KVServiceGrpc.KVServiceImpl
             return;
         }
 
-        int batchSize = 1000;
+        logger.info("Starting async range scan from '{}' to '{}'", keySince, keyTo);
 
-        try
-        {
-            Iterator<Map.Entry<String, byte[]>> it = repository.range(keySince, keyTo, batchSize);
-            while (it.hasNext())
-            {
-                Map.Entry<String, byte[]> entry = it.next();
-                com.vk.internship.Entry.Builder builder = com.vk.internship.Entry.newBuilder()
-                        .setKey(entry.getKey());
-                if (entry.getValue() != null)
+        int batchSize = 1000;
+        repository.rangeAsync(keySince, keyTo, batchSize, entry ->
                 {
-                    builder.setValue(ByteString.copyFrom(entry.getValue()));
-                }
-                responseObserver.onNext(builder.build());
-            }
-            responseObserver.onCompleted();
-        } catch (Exception e)
-        {
-            responseObserver.onError(
-                    Status.INTERNAL.withDescription("Range failed: " + e.getMessage())
-                            .asRuntimeException());
-        }
+                    Entry.Builder protoEntryBuilder = Entry.newBuilder()
+                            .setKey(entry.getKey());
+                    if (entry.getValue() != null)
+                    {
+                        protoEntryBuilder.setValue(ByteString.copyFrom(entry.getValue()));
+                    }
+
+                    responseObserver.onNext(protoEntryBuilder.build());
+                })
+                .whenComplete((v, ex) ->
+                {
+                    if (ex != null)
+                    {
+                        logger.error("Range request failed: {}", ex.getMessage(), ex);
+                        responseObserver.onError(
+                                Status.INTERNAL.withCause(ex).asRuntimeException());
+                    } else
+                    {
+                        responseObserver.onCompleted();
+                    }
+                });
+
+
     }
 
     @Override
     public void count(com.vk.internship.CountRequest request,
                       StreamObserver<com.vk.internship.CountResponse> responseObserver)
     {
-        try
+        repository.countAsync().whenComplete((count, ex) ->
         {
-            long count = repository.count();
-
-            responseObserver.onNext(
-                    com.vk.internship.CountResponse.newBuilder().setCount(count).build());
-            responseObserver.onCompleted();
-        } catch (Exception e)
-        {
-            responseObserver.onError(
-                    Status.INTERNAL.withDescription("Failed to get count: " + e.getMessage())
-                            .asRuntimeException());
-        }
+            if (ex != null)
+            {
+                logger.error("Failed to get count: {}", ex.getMessage(), ex);
+                responseObserver.onError(Status.INTERNAL.withCause(ex).asRuntimeException());
+            } else
+            {
+                responseObserver.onNext(CountResponse.newBuilder().setCount(count).build());
+                responseObserver.onCompleted();
+            }
+        });
 
     }
 

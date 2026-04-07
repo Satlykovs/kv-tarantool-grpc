@@ -7,4 +7,20 @@ services:
     volumes:
       - ./tarantool/init.lua:/opt/tarantool/init.lua
     command: tarantool /opt/tarantool/init.lua
-    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  kv_service:
+    build: .
+    container_name: kv_service
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    depends_on:
+      tarantool_db:
+        condition: service_healthy
